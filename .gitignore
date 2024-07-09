@@ -1,0 +1,5 @@
+outputs
+uploads
+poetry.lock
+.env
+final_outputs

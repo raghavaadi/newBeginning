@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "video-processing-microservice"
+version = "0.1.0"
+description = "A microservice for processing videos and creating short-form content"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+fastapi = "^0.68.0"
+uvicorn = "^0.15.0"
+python-multipart = "^0.0.5"
+moviepy = "^1.0.3"
+opencv-python = "^4.5.3"
+numpy = "^1.21.2"
+Pillow = "^8.3.1"
+pytesseract = "^0.3.8"
+groq = "^0.4.0"
+requests = "^2.26.0"
+python-dotenv = "^0.19.0"
+pydantic = "^1.8.2"
+aiofiles = "^0.8.0"
+SpeechRecognition = "^3.8.1"
+pydub = "^0.25.1"
+
+
+[tool.poetry.dev-dependencies]
+pytest = "^6.2.5"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

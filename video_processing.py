@@ -1,32 +1,41 @@
 import os
 import cv2
 import numpy as np
-from moviepy.editor import VideoFileClip, concatenate_videoclips, CompositeVideoClip, vfx, TextClip
+from moviepy.editor import VideoFileClip, CompositeVideoClip, vfx
+from moviepy.video.fx.all import fadeout, fadein
 from moviepy.video.VideoClip import ImageClip
 from typing import List, Tuple
 import logging
 from models import VideoAnalysis
-from audio_processing import extract_audio, transcribe_audio, get_word_timings, transcribe_audio_whisper
+from audio_processing import extract_audio, transcribe_audio, transcribe_audio_whisper
 from content_analysis import analyze_content
 from PIL import Image, ImageDraw, ImageFont
 import pytesseract
 from collections import deque
+from fastapi import HTTPException
+from typing import Dict
+from moviepy.editor import VideoFileClip, concatenate_videoclips, CompositeVideoClip, vfx
+from utils import get_next_api_key, exponential_backoff
+import time
 logger = logging.getLogger(__name__)
 
-def extract_key_frames(video_path: str, interval: int = 5) -> tuple:
+def extract_key_frames(video_path: str, interval: int = 5) -> Tuple[List[np.ndarray], List[float]]:
     logger.info(f"Extracting key frames from {video_path} at {interval} second intervals")
     video = cv2.VideoCapture(video_path)
     frames = []
     timestamps = []
     count = 0
+    fps = video.get(cv2.CAP_PROP_FPS)
+    
     while True:
         ret, frame = video.read()
         if not ret:
             break
-        if count % (30 * interval) == 0:  # Assuming 30 fps, extract every 'interval' seconds
+        if count % int(fps * interval) == 0:
             frames.append(frame)
-            timestamps.append(count / 30)  # Convert frame count to seconds
+            timestamps.append(count / fps)
         count += 1
+    
     video.release()
     logger.info(f"Extracted {len(frames)} key frames")
     return frames, timestamps
@@ -34,19 +43,16 @@ def extract_key_frames(video_path: str, interval: int = 5) -> tuple:
 def detect_text_in_frame(frame: np.ndarray) -> str:
     img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     text = pytesseract.image_to_string(img)
-    return text
+    return text.strip()
 
-def create_short_clip(video_path: str, start_time: float, duration: int, output_path: str):
+
+def create_short_clip(video_path: str, start_time: float, duration: int, output_path: str, fade_duration: float = 0.5):
     logger.info(f"Creating short clip: start_time={start_time}, duration={duration}, output_path={output_path}")
     try:
         with VideoFileClip(video_path) as video:
-            end_time = min(start_time + duration, video.duration)
-            clip = video.subclip(start_time, end_time)
-            
-            if clip.audio is None:
-                logger.warning("No audio found in the original video")
-            else:
-                logger.info("Audio track found and included in the clip")
+            clip = video.subclip(start_time, start_time + duration)
+            clip = clip.fx(fadein, duration=fade_duration)
+            clip = clip.fx(fadeout, duration=fade_duration)
             
             clip.write_videofile(output_path, 
                                  codec="libx264", 
@@ -54,53 +60,201 @@ def create_short_clip(video_path: str, start_time: float, duration: int, output_
                                  temp_audiofile=output_path.replace(".mp4", "-temp-audio.m4a"),
                                  remove_temp=True,
                                  logger=None)
-            
-        logger.info(f"Clip created successfully: {output_path}")
         
-        if os.path.exists(output_path):
-            file_size = os.path.getsize(output_path)
-            logger.info(f"Output file size: {file_size} bytes")
-            if file_size == 0:
-                raise ValueError("Generated clip file is empty")
-        else:
-            raise FileNotFoundError("Output clip file not found")
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise FileNotFoundError("Output clip file not found or is empty")
         
     except Exception as e:
         logger.error(f"Error creating clip: {str(e)}")
         raise
 
+def create_final_video(clips: List[dict], output_path: str, transition_duration: float = 0.5):
+    logger.info(f"Creating final video with {len(clips)} clips")
+    try:
+        video_clips = []
+        for i, clip_info in enumerate(clips):
+            clip = VideoFileClip(clip_info['path'])
+            if i > 0:  # Add fade in to all clips except the first one
+                clip = clip.fx(fadein, duration=transition_duration)
+            if i < len(clips) - 1:  # Add fade out to all clips except the last one
+                clip = clip.fx(fadeout, duration=transition_duration)
+            video_clips.append(clip)
+        
+        # Overlap the clips slightly to create a smooth transition
+        final_clips = []
+        for i, clip in enumerate(video_clips):
+            if i > 0:
+                start_time = sum(c.duration for c in final_clips) - transition_duration
+                final_clips.append(clip.set_start(start_time))
+            else:
+                final_clips.append(clip)
+        
+        # Create the final composite video
+        final_clip = CompositeVideoClip(final_clips)
+        
+        # Write the final video
+        final_clip.write_videofile(output_path,
+                                   codec="libx264",
+                                   audio_codec="aac",
+                                   temp_audiofile=output_path.replace(".mp4", "-temp-audio.m4a"),
+                                   remove_temp=True,
+                                   logger=None)
+        
+        logger.info(f"Final video created successfully: {output_path}")
+    except Exception as e:
+        logger.error(f"Error creating final video: {str(e)}")
+        raise
+    finally:
+        # Close all clip objects to free up resources
+        for clip in video_clips:
+            clip.close()
+
+
+@exponential_backoff(max_retries=5, base_delay=1, max_delay=60)
 async def process_video(video_path: str) -> VideoAnalysis:
-    logger.info("Starting video processing")
-    audio_path = extract_audio(video_path)
-    logger.info("Audio extraction completed")
+    logger.info(f"Starting video processing for: {video_path}")
+    temp_files = []
+    api_request_count = 0
     
-    transcript = transcribe_audio(audio_path)
-    logger.info("Audio transcription completed")
-    
-    logger.info("Extracting key frames")
-    frames, timestamps = extract_key_frames(video_path)
-    logger.info(f"Extracted {len(frames)} key frames")
-    
-    logger.info("Detecting text in frames")
-    frame_texts = [detect_text_in_frame(frame) for frame in frames]
-    logger.info("Text detection completed")
-    
-    logger.info("Analyzing content")
-    analysis = analyze_content(transcript, frame_texts, timestamps)
-    logger.info("Content analysis completed")
-    
-    clips = []
-    logger.info("Creating short clips")
-    for i, clip_info in enumerate(analysis.get('clips', [])):
-        output_path = f"outputs/clip_{i+1}.mp4"
-        create_short_clip(video_path, clip_info['start_time'], clip_info['duration'], output_path)
-        clips.append({
-            "path": output_path,
-            "description": clip_info['description']
-        })
-    logger.info(f"Created {len(clips)} short clips")
-    
-    return VideoAnalysis(analysis=analysis, transcript=transcript, clips=clips)
+    try:
+        # Step 1: Extract audio
+        audio_path = extract_audio(video_path)
+        temp_files.append(audio_path)
+        logger.info(f"Audio extracted: {audio_path}")
+
+        # Step 2: Transcribe audio
+        transcript = transcribe_audio_whisper(audio_path)
+        api_request_count += 1
+        logger.info(f"Transcription completed. Length: {len(transcript)} characters. API requests so far: {api_request_count}")
+
+        # Add a small delay between API calls
+        time.sleep(1)
+
+        # Step 3: Extract key frames
+        frames, timestamps = extract_key_frames(video_path)
+        logger.info(f"Extracted {len(frames)} key frames")
+
+        # Step 4: Detect text in frames
+        frame_texts = [detect_text_in_frame(frame) for frame in frames]
+        logger.info("Text detection in frames completed")
+
+        # Step 5: Analyze content
+        analysis = analyze_content(transcript, frame_texts, timestamps)
+        api_request_count += 1
+        logger.info(f"Content analysis completed. API requests so far: {api_request_count}")
+
+        # Step 6: Create short clips
+        clips = []
+        for i, clip_info in enumerate(analysis.get('clips', [])):
+            if not isinstance(clip_info, dict):
+                logger.warning(f"Unexpected clip info format: {clip_info}")
+                continue
+
+            start_time = clip_info.get('start_time')
+            duration = clip_info.get('duration')
+            description = clip_info.get('description')
+
+            if start_time is None or duration is None:
+                logger.warning(f"Missing start_time or duration for clip {i+1}")
+                continue
+
+            try:
+                start_time = float(start_time)
+                duration = int(duration)
+            except ValueError:
+                logger.warning(f"Invalid start_time or duration for clip {i+1}")
+                continue
+
+            output_path = f"outputs/clip_{i+1}.mp4"
+            temp_files.append(output_path)
+            try:
+                create_short_clip(
+                    video_path, 
+                    start_time, 
+                    duration, 
+                    output_path,
+                    fade_duration=0.5
+                )
+                clips.append({
+                    "path": output_path,
+                    "description": description
+                })
+            except Exception as e:
+                logger.error(f"Error creating clip {i+1}: {str(e)}")
+                continue
+
+        logger.info(f"Created {len(clips)} short clips")
+
+        # Step 7: Autoframe and stabilize clips
+        stabilized_clips = []
+        for i, clip_info in enumerate(clips):
+            try:
+                with VideoFileClip(clip_info['path']) as clip:
+                    stabilized_clip = autoframe_and_stabilize_clip(clip)
+                    stabilized_path = f"outputs/stabilized_clip_{i+1}.mp4"
+                    temp_files.append(stabilized_path)
+                    stabilized_clip.write_videofile(stabilized_path,
+                                                    codec="libx264",
+                                                    audio_codec="aac",
+                                                    temp_audiofile=stabilized_path.replace(".mp4", "-temp-audio.m4a"),
+                                                    remove_temp=True,
+                                                    logger=None)
+                    stabilized_clips.append({
+                        "path": stabilized_path,
+                        "description": clip_info['description']
+                    })
+            except Exception as e:
+                logger.error(f"Error stabilizing clip {i+1}: {str(e)}")
+                continue
+
+        logger.info("Clips autoframed and stabilized")
+
+        # Step 8: Add captions to clips
+        captioned_clips = []
+        for i, clip_info in enumerate(stabilized_clips):
+            try:
+                clip = VideoFileClip(clip_info['path'])
+                captioned_clip = sync_captions_with_lip_movement(clip, transcript)
+                captioned_path = f"outputs/captioned_clip_{i+1}.mp4"
+                temp_files.append(captioned_path)
+                captioned_clip.write_videofile(captioned_path,
+                                               codec="libx264",
+                                               audio_codec="aac",
+                                               temp_audiofile=captioned_path.replace(".mp4", "-temp-audio.m4a"),
+                                               remove_temp=True,
+                                               logger=None)
+                captioned_clips.append({
+                    "path": captioned_path,
+                    "description": clip_info['description']
+                })
+                clip.close()
+                captioned_clip.close()
+            except Exception as e:
+                logger.error(f"Error adding captions to clip {i+1}: {str(e)}")
+                continue
+
+        logger.info("Captions added to clips")
+
+        # Prepare the result
+        result = VideoAnalysis(
+            analysis=analysis,
+            transcript=transcript,
+            clips=captioned_clips
+        )
+
+        logger.info(f"Video processing completed. Total API requests: {api_request_count}")
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in video processing: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error in video processing: {str(e)}")
+
+    finally:
+        # Clean up temporary files
+        for file in temp_files:
+            if os.path.exists(file):
+                os.remove(file)
+                logger.info(f"Removed temporary file: {file}")
 
 def create_content_from_shorts(output_folder: str, final_output_folder: str):
     logger.info(f"Creating content from shorts in folder: {output_folder}")
@@ -115,44 +269,30 @@ def create_content_from_shorts(output_folder: str, final_output_folder: str):
             logger.info(f"Processing clip: {clip_path}")
             
             try:
+                # Step 1: Load the clip
                 clip = VideoFileClip(clip_path)
                 
-                # Autoframe, stabilize, and resize the clip to shorts aspect ratio
+                # Step 2: Autoframe and stabilize the clip
+                logger.info("Autoframing and stabilizing clip")
                 processed_clip = autoframe_and_stabilize_clip(clip)
+                processed_clip_path = os.path.join(output_folder, f"processed_clip_{i}.mp4")
+                processed_clip.write_videofile(processed_clip_path, codec="libx264", audio_codec="aac")
                 
-                # Extract audio and get word timings
+                # Step 3: Extract audio and get transcript
+                logger.info("Extracting audio and transcribing")
                 audio_path = clip_path.replace('.mp4', '.wav')
                 clip.audio.write_audiofile(audio_path)
                 transcript = transcribe_audio_whisper(audio_path)
                 
-                # Create caption clips
-                caption_clips = []
-                for segment in transcript['segments']:
-                    text = segment['text']
-                    start = segment['start']
-                    end = segment['end']
-                    words = text.split()
-                    for word in words:
-                        word_duration = (end - start) / len(words)
-                        caption = create_caption_image(text, word, (processed_clip.w, 200))
-                        caption_clip = ImageClip(caption).set_duration(word_duration).set_start(start)
-                        caption_clips.append(caption_clip)
-                        start += word_duration
+                # Step 4: Process clip with synchronized captions
+                logger.info("Generating synchronized captions")
+                captioned_clip = sync_captions_with_lip_movement(processed_clip, transcript)
                 
-                # Composite the processed clip with captions
-                captioned_clip = CompositeVideoClip([processed_clip] + caption_clips)
+                # Step 5: Write the final captioned video
+                captioned_output_path = os.path.join(final_output_folder, f"final_clip_{i}.mp4")
+                captioned_clip.write_videofile(captioned_output_path, codec="libx264", audio_codec="aac")
                 
-                # Add transitions
-                final_clip = captioned_clip.fx(vfx.fadeout, duration=0.5).fx(vfx.fadein, duration=0.5)
-                
-                # Composite the main video
-                final_video = CompositeVideoClip([final_clip])
-                
-                # Write the result to a file
-                final_output_path = os.path.join(final_output_folder, f"final_clip_{i}.mp4")
-                final_video.write_videofile(final_output_path, codec="libx264", audio_codec="aac")
-                
-                logger.info(f"Final video created: {final_output_path}")
+                logger.info(f"Final captioned video created: {captioned_output_path}")
             
             except Exception as e:
                 logger.error(f"Error processing clip {clip_file}: {str(e)}")
@@ -160,13 +300,22 @@ def create_content_from_shorts(output_folder: str, final_output_folder: str):
             
             finally:
                 # Clean up
+                if 'clip' in locals():
+                    clip.close()
+                if 'processed_clip' in locals():
+                    processed_clip.close()
+                if 'captioned_clip' in locals():
+                    captioned_clip.close()
                 if 'audio_path' in locals() and os.path.exists(audio_path):
                     os.remove(audio_path)
+                if 'processed_clip_path' in locals() and os.path.exists(processed_clip_path):
+                    os.remove(processed_clip_path)
 
     except Exception as e:
         logger.error(f"Error creating content from shorts: {str(e)}")
         raise
 
+    logger.info("Content creation from shorts completed")
 def detect_face(frame):
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -279,6 +428,7 @@ def stabilize_video(clip: VideoFileClip) -> VideoFileClip:
     logger.info("Video stabilization completed")
     return clip.fl_image(make_frame)
 
+
 def autoframe_and_stabilize_clip(clip: VideoFileClip, target_aspect_ratio: float = 9/16, smoothing_window: int = 30) -> VideoFileClip:
     try:
         stabilized_clip = stabilize_video(clip)
@@ -289,11 +439,16 @@ def autoframe_and_stabilize_clip(clip: VideoFileClip, target_aspect_ratio: float
     center_x_queue = deque(maxlen=smoothing_window)
     center_y_queue = deque(maxlen=smoothing_window)
 
+    # Get the original video dimensions
+    orig_height, orig_width = clip.h, clip.w
+
+    # Calculate the target width based on the original height and desired aspect ratio
+    target_width = int(orig_height * target_aspect_ratio)
+
     def process_frame(frame):
         face = detect_face(frame)
         
         frame_h, frame_w = frame.shape[:2]
-        target_w = int(frame_h * target_aspect_ratio)
         
         if face is not None:
             x, y, w, h = face
@@ -307,35 +462,88 @@ def autoframe_and_stabilize_clip(clip: VideoFileClip, target_aspect_ratio: float
         smooth_center_x = int(sum(center_x_queue) / len(center_x_queue))
         smooth_center_y = int(sum(center_y_queue) / len(center_y_queue))
 
-        x1 = max(0, smooth_center_x - target_w//2)
-        x2 = min(frame_w, x1 + target_w)
+        # Calculate crop boundaries
+        x1 = max(0, smooth_center_x - target_width//2)
+        x2 = min(frame_w, x1 + target_width)
 
         # Ensure we don't go out of bounds
         if x2 == frame_w:
-            x1 = max(0, x2 - target_w)
+            x1 = max(0, x2 - target_width)
         
+        # Crop the frame
         cropped_frame = frame[:, x1:x2]
         
-        # Resize the frame to maintain consistent output size
-        return cv2.resize(cropped_frame, (int(frame_h * target_aspect_ratio), frame_h))
+        # Resize only if necessary, using high-quality interpolation
+        if cropped_frame.shape[:2] != (orig_height, target_width):
+            cropped_frame = cv2.resize(cropped_frame, (target_width, orig_height), 
+                                       interpolation=cv2.INTER_LANCZOS4)
+        
+        return cropped_frame
 
     return stabilized_clip.fl_image(process_frame)
 
+
+def detect_lip_movement(frame):
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    mouth_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_mouth.xml')
+    
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+    
+    for (x, y, w, h) in faces:
+        roi_gray = gray[y:y+h, x:x+w]
+        mouths = mouth_cascade.detectMultiScale(roi_gray, 1.7, 11)
+        
+        if len(mouths) > 0:
+            return True
+    
+    return False
+
 def create_caption_image(text: str, highlight_word: str, size: Tuple[int, int]) -> np.ndarray:
-    font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 10)
+    font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 24)
     image = Image.new('RGBA', size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     
     words = text.split()
-    x, y = 10, 10
+    x, y = 10, size[1] - 40  # Position at the bottom
     for word in words:
         word_width, word_height = draw.textsize(word + " ", font=font)
         if x + word_width > size[0] - 10:
             x = 10
-            y += word_height + 5
-        if word == highlight_word:
+            y -= word_height + 5
+        if word.lower() == highlight_word.lower():
             draw.rectangle([x, y, x + word_width, y + word_height], fill=(255, 255, 0, 128))
         draw.text((x, y), word, font=font, fill=(255, 255, 255, 255))
         x += word_width
-
     return np.array(image)
+
+def sync_captions_with_lip_movement(clip: VideoFileClip, transcript: dict) -> CompositeVideoClip:
+    def make_frame(t):
+        current_frame = clip.get_frame(t)
+        
+        # Find the current segment and word
+        current_segment = next((seg for seg in transcript['segments'] if seg['start'] <= t < seg['end']), None)
+        if current_segment:
+            words = current_segment['text'].split()
+            word_duration = (current_segment['end'] - current_segment['start']) / len(words)
+            current_word_index = int((t - current_segment['start']) / word_duration)
+            current_word = words[min(current_word_index, len(words) - 1)]
+            
+            # Check for lip movement
+            lip_moving = detect_lip_movement(current_frame)
+            
+            if lip_moving:
+                caption = create_caption_image(current_segment['text'], current_word, (clip.w, clip.h))
+                return np.maximum(current_frame, caption)
+        
+        return current_frame
+
+    return clip.fl(make_frame)
+
+def process_clip_with_captions(clip_path: str, transcript: dict, output_path: str):
+    clip = VideoFileClip(clip_path)
+    captioned_clip = sync_captions_with_lip_movement(clip, transcript)
+    captioned_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
+    clip.close()
+    captioned_clip.close()
+

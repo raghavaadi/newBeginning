@@ -4,16 +4,36 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from models import VideoAnalysis
 from video_processing import process_video, create_content_from_shorts
-from utils import setup_directories, cleanup_files
-
+from utils import initialize_app, setup_directories, cleanup_files
+import signal
+import sys
 # Set up logging
+interrupt_requested = False
+
+def signal_handler(signum, frame):
+    global interrupt_requested
+    interrupt_requested = True
+    print("Interrupt received. Stopping gracefully...")
+
+# Set up the signal handler
+signal.signal(signal.SIGINT, signal_handler)
+
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+# @app.on_event("startup")
+# async def startup_event():
+#     # initialize_app()
+
+
 @app.post("/process-video/", response_model=VideoAnalysis)
 async def process_video_endpoint(file: UploadFile = File(...)):
+    global interrupt_requested
+    if interrupt_requested:
+        raise HTTPException(status_code=400, detail="Operation cancelled by user")
+    
     logger.info(f"Received video for processing: {file.filename}")
     
     setup_directories()
@@ -25,6 +45,8 @@ async def process_video_endpoint(file: UploadFile = File(...)):
     
     try:
         result = await process_video(video_path)
+        if interrupt_requested:
+            raise KeyboardInterrupt("Operation cancelled by user")
         return result
     except Exception as e:
         logger.error(f"Error processing video: {str(e)}")

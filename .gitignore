@@ -3,3 +3,4 @@ uploads
 poetry.lock
 .env
 final_outputs
+__pycache__/

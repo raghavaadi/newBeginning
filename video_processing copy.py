@@ -10,6 +10,11 @@ from audio_processing import extract_audio, transcribe_audio, get_word_timings, 
 from content_analysis import analyze_content
 from PIL import Image, ImageDraw, ImageFont
 import pytesseract
+from fastapi import HTTPException
+from models import VideoAnalysis
+from audio_processing import extract_audio, transcribe_audio_whisper
+from content_analysis import analyze_content
+from typing import Dict
 logger = logging.getLogger(__name__)
 
 def extract_key_frames(video_path: str, interval: int = 5) -> tuple:
@@ -68,38 +73,114 @@ def create_short_clip(video_path: str, start_time: float, duration: int, output_
         logger.error(f"Error creating clip: {str(e)}")
         raise
 
-async def process_video(video_path: str) -> VideoAnalysis:
-    logger.info("Starting video processing")
-    audio_path = extract_audio(video_path)
-    logger.info("Audio extraction completed")
+async def process_video(video_path: str) -> Dict:
+    logger.info(f"Starting video processing for: {video_path}")
+    temp_files = []
     
-    transcript = transcribe_audio(audio_path)
-    logger.info("Audio transcription completed")
-    
-    logger.info("Extracting key frames")
-    frames, timestamps = extract_key_frames(video_path)
-    logger.info(f"Extracted {len(frames)} key frames")
-    
-    logger.info("Detecting text in frames")
-    frame_texts = [detect_text_in_frame(frame) for frame in frames]
-    logger.info("Text detection completed")
-    
-    logger.info("Analyzing content")
-    analysis = analyze_content(transcript, frame_texts, timestamps)
-    logger.info("Content analysis completed")
-    
-    clips = []
-    logger.info("Creating short clips")
-    for i, clip_info in enumerate(analysis.get('clips', [])):
-        output_path = f"outputs/clip_{i+1}.mp4"
-        create_short_clip(video_path, clip_info['start_time'], clip_info['duration'], output_path)
-        clips.append({
-            "path": output_path,
-            "description": clip_info['description']
-        })
-    logger.info(f"Created {len(clips)} short clips")
-    
-    return VideoAnalysis(analysis=analysis, transcript=transcript, clips=clips)
+    try:
+        # Step 1: Extract audio
+        audio_path = extract_audio(video_path)
+        temp_files.append(audio_path)
+        logger.info(f"Audio extracted: {audio_path}")
+
+        # Step 2: Transcribe audio
+        transcript_result = transcribe_audio_whisper(audio_path)
+        logger.info(f"Transcription completed")
+
+        # Extract full text from transcript result
+        full_transcript = transcript_result.get('text', '')
+        
+        # Step 3: Extract key frames
+        frames, timestamps = extract_key_frames(video_path)
+        logger.info(f"Extracted {len(frames)} key frames")
+
+        # Step 4: Detect text in frames
+        frame_texts = [detect_text_in_frame(frame) for frame in frames]
+        logger.info("Text detection in frames completed")
+
+        # Step 5: Analyze content
+        analysis = analyze_content(transcript_result, frame_texts, timestamps)
+        logger.info("Content analysis completed")
+
+        # Step 6: Create short clips
+        clips = []
+        for i, clip_info in enumerate(analysis.get('clips', [])):
+            if not isinstance(clip_info, dict):
+                logger.warning(f"Unexpected clip info format: {clip_info}")
+                continue
+
+            start_time = clip_info.get('start_time')
+            duration = clip_info.get('duration')
+            description = clip_info.get('description')
+
+            if start_time is None or duration is None:
+                logger.warning(f"Missing start_time or duration for clip {i+1}")
+                continue
+
+            try:
+                start_time = float(start_time)
+                duration = int(duration)
+            except ValueError:
+                logger.warning(f"Invalid start_time or duration for clip {i+1}")
+                continue
+
+            output_path = f"outputs/clip_{i+1}.mp4"
+            temp_files.append(output_path)
+            try:
+                create_short_clip(video_path, start_time, duration, output_path, fade_duration=0.5)
+                clips.append({
+                    "path": output_path,
+                    "description": description
+                })
+            except Exception as e:
+                logger.error(f"Error creating clip {i+1}: {str(e)}")
+                continue
+
+        logger.info(f"Created {len(clips)} short clips")
+
+        # Step 7: Autoframe and stabilize clips
+        stabilized_clips = []
+        for i, clip_info in enumerate(clips):
+            try:
+                with VideoFileClip(clip_info['path']) as clip:
+                    stabilized_clip = autoframe_and_stabilize_clip(clip)
+                    stabilized_path = f"outputs/stabilized_clip_{i+1}.mp4"
+                    temp_files.append(stabilized_path)
+                    stabilized_clip.write_videofile(stabilized_path,
+                                                    codec="libx264",
+                                                    audio_codec="aac",
+                                                    temp_audiofile=stabilized_path.replace(".mp4", "-temp-audio.m4a"),
+                                                    remove_temp=True,
+                                                    logger=None)
+                    stabilized_clips.append({
+                        "path": stabilized_path,
+                        "description": clip_info['description']
+                    })
+            except Exception as e:
+                logger.error(f"Error stabilizing clip {i+1}: {str(e)}")
+                continue
+
+        logger.info("Clips autoframed and stabilized")
+
+        # Create the VideoAnalysis object
+        result = VideoAnalysis(
+            analysis=analysis,
+            transcript=full_transcript,
+            clips=stabilized_clips
+        )
+
+        return result.dict()
+
+    except Exception as e:
+        logger.error(f"Error in video processing: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error in video processing: {str(e)}")
+
+    finally:
+        # Clean up temporary files
+        for file in temp_files:
+            if os.path.exists(file):
+                os.remove(file)
+                logger.info(f"Removed temporary file: {file}")
 
 def create_content_from_shorts(output_folder: str, final_output_folder: str):
     logger.info(f"Creating content from shorts in folder: {output_folder}")

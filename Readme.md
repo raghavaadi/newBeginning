@@ -71,3 +71,18 @@ curl -X POST "http://localhost:8000/process-video/" -H "accept: application/json
 ## License
 
 [MIT License](LICENSE)
+
+
+
+
+
+following additional techniques:
+
+Content-aware transitions: Analyze the content of adjacent clips to determine the best transition type (e.g., fade, dissolve, wipe) based on visual similarity.
+Audio crossfading: Implement separate audio crossfades to ensure smooth audio transitions between clips.
+Motion-based transitions: Use motion estimation to create more natural transitions when there's significant movement between clips.
+Adaptive transition duration: Adjust the transition duration based on the content and length of the clips for more natural-feeling transition
+
+
+
+poetry run uvicorn main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
